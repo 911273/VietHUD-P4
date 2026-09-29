@@ -4,8 +4,37 @@
 #include "pincfg.h"
 #include <Arduino.h>
 #include <SD_MMC.h>
+#ifdef VIETHUD_P4
+#include <FFat.h>
+#endif
+
+// The filesystem every read/write below goes through. Always the microSD card
+// on the S3; on the P4 board it falls back to the FAT partition in its 16MB
+// flash ("ffat", holding the core speedmap data) when no card is present —
+// see ensureSdMmcBegun(). Paths are FS-relative ("/speedmap/..."), so both
+// work unchanged.
+static fs::FS *gDataFs = &SD_MMC;
+#define DATA_FS (*gDataFs)
+static bool gDataOnFlash = false;
+fs::FS &sdMgrDataFs() { return *gDataFs; }
+bool sdMgrDataOnFlash() { return gDataOnFlash; }
+static uint64_t dataFsTotalBytes() {
+#ifdef VIETHUD_P4
+    if (gDataOnFlash) return FFat.totalBytes();
+#endif
+    return SD_MMC.totalBytes();
+}
+static uint64_t dataFsUsedBytes() {
+#ifdef VIETHUD_P4
+    if (gDataOnFlash) return FFat.usedBytes();
+#endif
+    return SD_MMC.usedBytes();
+}
 #include <esp_heap_caps.h>
-#include <esp_task_wdt.h> // esp_task_wdt_reset() — see ensureSdMmcBegun()'s own comment
+#include <esp_task_wdt.h>
+#ifdef VIETHUD_P4
+#include <esp_ldo_regulator.h>
+#endif // esp_task_wdt_reset() — see ensureSdMmcBegun()'s own comment
 #include <mbedtls/sha256.h> // sdMgrSha256File() — data-install readback verify
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -194,6 +223,52 @@ static bool ensureSdMmcBegun() {
     if (lastFailedAttemptMs != 0 && now - lastFailedAttemptMs < kRetryCooldownMs) return false;
     lastFailedAttemptMs = now; // set up front — every early return below is a failed attempt
 
+#ifdef VIETHUD_P4
+    // JC4880P443C: 4-bit SDMMC slot0 on IO_MUX pins, and TF_VCC is fed by the
+    // P4's on-chip LDO channel 4 (always-on P-FET, GPIO45 enable not fitted) —
+    // without it the card is unpowered and init times out with 0x107, which
+    // is exactly what the factory fw logged. SD_MMC must not grab an LDO
+    // itself (setPowerChannel(-1)) or it collides with this one.
+    {
+        static esp_ldo_channel_handle_t sSdLdo = nullptr;
+        if (!sSdLdo) {
+            esp_ldo_channel_config_t lc = {};
+            lc.chan_id = SD_LDO_CHAN;
+            lc.voltage_mv = 3300;
+            if (esp_ldo_acquire_channel(&lc, &sSdLdo) != ESP_OK) Serial.println("[sdmgr] LDO4 (TF_VCC) acquire failed");
+            delay(50);
+        }
+        SD_MMC.end();
+        SD_MMC.setPins(SD_MMC_CLK_PIN, SD_MMC_CMD_PIN, SD_MMC_D0_PIN, SD_MMC_D1_PIN, SD_MMC_D2_PIN, SD_MMC_D3_PIN);
+        SD_MMC.setPowerChannel(-1);
+        static const int kFreqs[] = {SDMMC_FREQ_HIGHSPEED, SDMMC_FREQ_DEFAULT, SDMMC_FREQ_PROBING};
+        for (int f : kFreqs) {
+            if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset(); // caller task may not be subscribed (IDF 5 logs an error then)
+            if (SD_MMC.begin("/sdmmc", false, false, f)) {
+                sdMmcBegun = true;
+                Serial.printf("[sdmgr] SD mounted (4-bit, %d kHz): %llu MB, type %d\n", f,
+                              SD_MMC.cardSize() / (1024 * 1024), SD_MMC.cardType());
+                return true;
+            }
+            SD_MMC.end();
+            delay(50);
+        }
+        Serial.println("[sdmgr] SD_MMC.begin() failed — no card detected");
+        // No card: use the core data flashed into the "ffat" partition
+        // (partitions_p4_data.csv; image built by `pio run -t buildfs`).
+        if (FFat.begin(false, "/ffat", 10, "ffat") && FFat.exists("/speedmap/metadata.bin")) {
+            gDataFs = &FFat;
+            gDataOnFlash = true;
+            sdMmcBegun = true;
+            Serial.printf("[sdmgr] using speedmap data from internal flash (FFat %u/%u KB)\n",
+                          (unsigned)(FFat.usedBytes() / 1024), (unsigned)(FFat.totalBytes() / 1024));
+            return true;
+        }
+        Serial.println("[sdmgr] no flash data partition either (flash it with -t uploadfs)");
+        return false;
+    }
+#endif
+
     // Tear the peripheral down before priming/re-initialising it (added
     // 2026-09-21). Confirmed on real hardware: after a run of rapid
     // upload-triggered soft resets, SD_MMC.begin() started failing with
@@ -287,8 +362,8 @@ bool sdMgrMount() {
     // with the "/sdmmc" mountpoint string passed to begin() above — that
     // string only registers the VFS mount internally (confirmed against
     // the vendor demo's own usage: it does SD_MMC.begin("/sdmmc", ...) but
-    // then SD_MMC.open("/music"), not SD_MMC.open("/sdmmc/music")).
-    File metaFile = SD_MMC.open("/speedmap/metadata.bin");
+    // then DATA_FS.open("/music"), not DATA_FS.open("/sdmmc/music")).
+    File metaFile = DATA_FS.open("/speedmap/metadata.bin");
     if (!metaFile) {
         Serial.println("[sdmgr] /speedmap/metadata.bin not found");
         return false;
@@ -310,7 +385,7 @@ bool sdMgrMount() {
         return false;
     }
 
-    File idxFile = SD_MMC.open("/speedmap/index.bin");
+    File idxFile = DATA_FS.open("/speedmap/index.bin");
     if (!idxFile) {
         Serial.println("[sdmgr] /speedmap/index.bin not found — MAP ERROR");
         return false;
@@ -388,7 +463,7 @@ bool sdMgrMount() {
         cameraPointCount = 0;
     }
     static const int kChunk = 256;
-    File camFile = SD_MMC.open("/speedmap/cameras.bin");
+    File camFile = DATA_FS.open("/speedmap/cameras.bin");
     if (camFile) {
         int n = (int)(camFile.size() / sizeof(CameraPoint));
         int cap = (int)(psramRoomFor((size_t)n * sizeof(CamPt)) / sizeof(CamPt));
@@ -451,7 +526,7 @@ bool sdMgrMount() {
         trafficSigns = NULL;
         trafficSignCount = 0;
     }
-    File signFile = SD_MMC.open("/speedmap/signs.bin");
+    File signFile = DATA_FS.open("/speedmap/signs.bin");
     if (signFile) {
         TrafficSignHeader hdr;
         if (signFile.read((uint8_t *)&hdr, sizeof(hdr)) == sizeof(hdr) &&
@@ -503,7 +578,7 @@ bool sdMgrMount() {
     roadNameCount = 0;
     roadNamePoolSize = 0;
     segNameWidth = 2;
-    File nameFile = SD_MMC.open("/speedmap/names.bin");
+    File nameFile = DATA_FS.open("/speedmap/names.bin");
     if (nameFile) {
         char magic[4];
         uint16_t version = 0;
@@ -578,7 +653,7 @@ bool sdMgrGetSigns(const SignPt **out, int *outCount) {
 bool sdMgrReadBytes(const char *path, uint32_t offset, uint8_t *outBuf, size_t len) {
     SdLock lock;
     if (!ensureSdMmcBegun() || !path || !outBuf || len == 0) return false;
-    File f = SD_MMC.open(path, FILE_READ);
+    File f = DATA_FS.open(path, FILE_READ);
     if (!f) return false;
     if (offset > 0 && !f.seek(offset)) {
         f.close();
@@ -598,7 +673,7 @@ bool sdMgrReadTile(const TileIndexEntry &entry, RoadSegment *outBuf, int maxSegm
     // rather than kept as a persistent handle, same "no extra state to get
     // wrong" reasoning every other read in this file already follows; SD_MMC
     // open() is cheap compared to the seek+read that follows anyway.
-    File f = SD_MMC.open("/speedmap/tiles.bin");
+    File f = DATA_FS.open("/speedmap/tiles.bin");
     if (!f) {
         Serial.println("[sdmgr] /speedmap/tiles.bin not found (treating tile as empty)");
         return false;
@@ -613,13 +688,28 @@ bool sdMgrReadTile(const TileIndexEntry &entry, RoadSegment *outBuf, int maxSegm
     size_t got = f.read((uint8_t *)outBuf, toRead * sizeof(RoadSegment));
     f.close();
     *outCount = (int)(got / sizeof(RoadSegment));
+    // Sanitize impossible limits from raw OSM maxspeed tags (found by the
+    // 2026-09-29 all-limits sweep: 2, and 6060 from a "60;60"-style tag).
+    // A doubled value decodes to itself; anything else outside 5..130 km/h
+    // becomes UNKNOWN rather than being shown or spoken. Odd-but-plausible
+    // values (51, 87, 89) are left as the data says.
+    for (int i = 0; i < *outCount; i++) {
+        int16_t &lim = outBuf[i].speedLimitKmh;
+        if (lim < 0 || (lim >= 5 && lim <= 130)) continue;
+        int16_t fixed = -1;
+        if (lim >= 1000 && lim % 100 == lim / 100 && lim % 100 >= 5 && lim % 100 <= 130) fixed = lim % 100;
+        static uint32_t sLogged = 0;
+        if (sLogged++ < 8)
+            Serial.printf("[sdmgr] seg %lu: invalid speed limit %d -> %d\n", (unsigned long)outBuf[i].id, lim, fixed);
+        lim = fixed;
+    }
     return true;
 }
 
 bool sdMgrDumpFileToSerial(const char *path) {
     SdLock lock;
     if (!ensureSdMmcBegun()) return false;
-    File f = SD_MMC.open(path, FILE_READ);
+    File f = DATA_FS.open(path, FILE_READ);
     if (!f) {
         Serial.printf("[sdmgr] dump: open failed: %s\n", path);
         return false;
@@ -646,7 +736,7 @@ void sdMgrSummarizeTripLogs(uint32_t firstSessionId, uint32_t lastSessionId) {
     for (uint32_t id = firstSessionId; id <= lastSessionId; id++) {
         char path[48];
         snprintf(path, sizeof(path), "/triplog/session_%04lu.csv", (unsigned long)id);
-        File f = SD_MMC.open(path, FILE_READ);
+        File f = DATA_FS.open(path, FILE_READ);
         if (!f) continue; // this session number just never got a file (e.g. logging was off that boot) — not an error
         size_t sizeBytes = f.size();
         int lineCount = 0;
@@ -682,7 +772,7 @@ void sdMgrSummarizeTripLogs(uint32_t firstSessionId, uint32_t lastSessionId) {
 int sdMgrListTripLogs(uint32_t *outIds, uint32_t *outSizes, int maxCount) {
     SdLock lock;
     if (!ensureSdMmcBegun()) return 0;
-    File dir = SD_MMC.open("/triplog");
+    File dir = DATA_FS.open("/triplog");
     if (!dir || !dir.isDirectory()) {
         if (dir) dir.close();
         return 0;
@@ -727,7 +817,8 @@ int sdMgrListTripLogs(uint32_t *outIds, uint32_t *outSizes, int maxCount) {
 int sdMgrDeleteAllTripLogs() {
     SdLock lock;
     if (!ensureSdMmcBegun()) return -1;
-    File dir = SD_MMC.open("/triplog");
+    if (gDataOnFlash) return -1; // P4 flash fallback is read-only map data (see ensureSdMmcBegun)
+    File dir = DATA_FS.open("/triplog");
     if (!dir || !dir.isDirectory()) {
         if (dir) dir.close();
         return 0;
@@ -750,7 +841,7 @@ int sdMgrDeleteAllTripLogs() {
     char path[40];
     for (int i = 0; i < n; i++) {
         snprintf(path, sizeof(path), "/triplog/session_%04lu.csv", (unsigned long)ids[i]);
-        if (SD_MMC.remove(path)) deleted++;
+        if (DATA_FS.remove(path)) deleted++;
     }
     Serial.printf("[sdmgr] deleted %d/%d trip log(s)\n", deleted, n);
     return deleted;
@@ -758,8 +849,8 @@ int sdMgrDeleteAllTripLogs() {
 
 int sdMgrReadFileChunk(const char *path, size_t offset, uint8_t *buf, size_t bufSize) {
     SdLock lock;
-    if (!ensureSdMmcBegun() || !SD_MMC.exists(path)) return -1; // quiet "not found" for optional files
-    File f = SD_MMC.open(path, FILE_READ);
+    if (!ensureSdMmcBegun() || !DATA_FS.exists(path)) return -1; // quiet "not found" for optional files
+    File f = DATA_FS.open(path, FILE_READ);
     if (!f) return -1;
     if (offset >= f.size()) {
         f.close();
@@ -777,9 +868,10 @@ int sdMgrReadFileChunk(const char *path, size_t offset, uint8_t *buf, size_t buf
 bool sdMgrAppendLine(const char *path, const char *line) {
     SdLock lock;
     if (!ensureSdMmcBegun()) return false;
+    if (gDataOnFlash) return false; // P4 flash fallback is read-only map data (see ensureSdMmcBegun)
 
     // FILE_APPEND creates the file if missing, but NOT missing parent
-    // directories — SD_MMC.mkdir() one level up first if the target isn't
+    // directories — DATA_FS.mkdir() one level up first if the target isn't
     // at the filesystem root. Single-level only (this project's only caller,
     // log/TripLogger.cpp, uses one fixed "/triplog" directory) — not a
     // recursive mkdir -p, since there's no current need for nested paths.
@@ -790,11 +882,11 @@ bool sdMgrAppendLine(const char *path, const char *line) {
         if (dirLen < sizeof(dir)) {
             memcpy(dir, path, dirLen);
             dir[dirLen] = '\0';
-            if (!SD_MMC.exists(dir)) SD_MMC.mkdir(dir);
+            if (!DATA_FS.exists(dir)) DATA_FS.mkdir(dir);
         }
     }
 
-    File f = SD_MMC.open(path, FILE_APPEND);
+    File f = DATA_FS.open(path, FILE_APPEND);
     if (!f) {
         Serial.printf("[sdmgr] append open failed: %s\n", path);
         return false;
@@ -812,6 +904,7 @@ bool sdMgrAppendLine(const char *path, const char *line) {
 bool sdMgrAppendBytes(const char *path, const uint8_t *buf, size_t len) {
     SdLock lock;
     if (!ensureSdMmcBegun()) return false;
+    if (gDataOnFlash) return false; // P4 flash fallback is read-only map data (see ensureSdMmcBegun)
     const char *slash = strrchr(path, '/');
     if (slash && slash != path) {
         char dir[64];
@@ -819,10 +912,10 @@ bool sdMgrAppendBytes(const char *path, const uint8_t *buf, size_t len) {
         if (dirLen < sizeof(dir)) {
             memcpy(dir, path, dirLen);
             dir[dirLen] = '\0';
-            if (!SD_MMC.exists(dir)) SD_MMC.mkdir(dir);
+            if (!DATA_FS.exists(dir)) DATA_FS.mkdir(dir);
         }
     }
-    File f = SD_MMC.open(path, FILE_APPEND);
+    File f = DATA_FS.open(path, FILE_APPEND);
     if (!f) return false;
     size_t wrote = f.write(buf, len);
     f.close();
@@ -832,15 +925,17 @@ bool sdMgrAppendBytes(const char *path, const uint8_t *buf, size_t len) {
 bool sdMgrRemove(const char *path) {
     SdLock lock;
     if (!ensureSdMmcBegun()) return false;
-    if (!SD_MMC.exists(path)) return true; // already gone = success
-    return SD_MMC.remove(path);
+    if (gDataOnFlash) return false; // P4 flash fallback is read-only map data (see ensureSdMmcBegun)
+    if (!DATA_FS.exists(path)) return true; // already gone = success
+    return DATA_FS.remove(path);
 }
 
 bool sdMgrRename(const char *from, const char *to) {
     SdLock lock;
     if (!ensureSdMmcBegun()) return false;
-    SD_MMC.remove(to); // rename won't overwrite an existing target on some FS impls
-    return SD_MMC.rename(from, to);
+    if (gDataOnFlash) return false; // P4 flash fallback is read-only map data (see ensureSdMmcBegun)
+    DATA_FS.remove(to); // rename won't overwrite an existing target on some FS impls
+    return DATA_FS.rename(from, to);
 }
 
 bool sdMgrFindTileEntry(uint32_t tileId, TileIndexEntry *outEntry) {
@@ -869,7 +964,7 @@ bool sdMgrFindTileEntry(uint32_t tileId, TileIndexEntry *outEntry) {
 
     // Direct file-based binary search on /speedmap/index.bin (0 KB PSRAM)
     if (!ensureSdMmcBegun()) return false;
-    File f = SD_MMC.open("/speedmap/index.bin", FILE_READ);
+    File f = DATA_FS.open("/speedmap/index.bin", FILE_READ);
     if (!f) return false;
 
     int lo = 0, hi = tileIndexCount - 1;
@@ -976,8 +1071,9 @@ static File sWriter;
 bool sdMgrWriterOpen(const char *path, bool append) {
     SdLock lock;
     if (!ensureSdMmcBegun()) return false;
+    if (gDataOnFlash) return false; // P4 flash fallback is read-only map data (see ensureSdMmcBegun)
     if (sWriter) sWriter.close();
-    sWriter = SD_MMC.open(path, append ? FILE_APPEND : FILE_WRITE);
+    sWriter = DATA_FS.open(path, append ? FILE_APPEND : FILE_WRITE);
     return (bool)sWriter;
 }
 
@@ -997,8 +1093,8 @@ void sdMgrWriterClose() {
 
 int64_t sdMgrFileSize(const char *path) {
     SdLock lock;
-    if (!ensureSdMmcBegun() || !SD_MMC.exists(path)) return -1; // exists() first: open() of a missing file logs an error
-    File f = SD_MMC.open(path, FILE_READ);
+    if (!ensureSdMmcBegun() || !DATA_FS.exists(path)) return -1; // exists() first: open() of a missing file logs an error
+    File f = DATA_FS.open(path, FILE_READ);
     if (!f) return -1;
     int64_t s = (int64_t)f.size();
     f.close();
@@ -1008,13 +1104,14 @@ int64_t sdMgrFileSize(const char *path) {
 bool sdMgrExists(const char *path) {
     SdLock lock;
     if (!ensureSdMmcBegun()) return false;
-    return SD_MMC.exists(path);
+    return DATA_FS.exists(path);
 }
 
 bool sdMgrMkdir(const char *path) {
     SdLock lock;
     if (!ensureSdMmcBegun()) return false;
-    return SD_MMC.exists(path) || SD_MMC.mkdir(path);
+    if (gDataOnFlash) return false; // P4 flash fallback is read-only map data (see ensureSdMmcBegun)
+    return DATA_FS.exists(path) || DATA_FS.mkdir(path);
 }
 
 // Plain rename that does NOT delete an existing target first (FAT rename fails
@@ -1023,13 +1120,14 @@ bool sdMgrMkdir(const char *path) {
 bool sdMgrMove(const char *from, const char *to) {
     SdLock lock;
     if (!ensureSdMmcBegun()) return false;
-    return SD_MMC.rename(from, to);
+    if (gDataOnFlash) return false; // P4 flash fallback is read-only map data (see ensureSdMmcBegun)
+    return DATA_FS.rename(from, to);
 }
 
 uint64_t sdMgrFreeBytes() {
     SdLock lock;
     if (!ensureSdMmcBegun()) return 0;
-    uint64_t total = SD_MMC.totalBytes(), used = SD_MMC.usedBytes();
+    uint64_t total = dataFsTotalBytes(), used = dataFsUsedBytes();
     return total > used ? total - used : 0;
 }
 
@@ -1037,7 +1135,8 @@ uint64_t sdMgrFreeBytes() {
 bool sdMgrWriteSmallFile(const char *path, const void *data, size_t len) {
     SdLock lock;
     if (!ensureSdMmcBegun()) return false;
-    File f = SD_MMC.open(path, FILE_WRITE);
+    if (gDataOnFlash) return false; // P4 flash fallback is read-only map data (see ensureSdMmcBegun)
+    File f = DATA_FS.open(path, FILE_WRITE);
     if (!f) return false;
     size_t w = f.write((const uint8_t *)data, len);
     f.flush();
@@ -1054,7 +1153,7 @@ bool sdMgrSha256File(const char *path, uint8_t out[32], void (*tick)()) {
     File f;
     {
         SdLock lock;
-        if (ensureSdMmcBegun()) f = SD_MMC.open(path, FILE_READ);
+        if (ensureSdMmcBegun()) f = DATA_FS.open(path, FILE_READ);
     }
     if (!f) {
         heap_caps_free(buf);
@@ -1090,7 +1189,8 @@ bool sdMgrSha256File(const char *path, uint8_t out[32], void (*tick)()) {
 int sdMgrClearDir(const char *dir) {
     SdLock lock;
     if (!ensureSdMmcBegun()) return -1;
-    File d = SD_MMC.open(dir);
+    if (gDataOnFlash) return -1; // P4 flash fallback is read-only map data (see ensureSdMmcBegun)
+    File d = DATA_FS.open(dir);
     if (!d || !d.isDirectory()) return 0;
     // Collect first, delete after: deleting while iterating is unreliable on SD_MMC.
     static char names[48][48];
@@ -1106,6 +1206,6 @@ int sdMgrClearDir(const char *dir) {
     d.close();
     int removed = 0;
     for (int i = 0; i < n; i++)
-        if (SD_MMC.remove(names[i])) removed++;
+        if (DATA_FS.remove(names[i])) removed++;
     return removed;
 }

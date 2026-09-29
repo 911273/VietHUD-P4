@@ -1,23 +1,35 @@
 #include "AudioPlayer.h"
 #include "core/AppConfig.h" // cfg.audioEnabled — master alert-audio toggle (Settings > Display)
 #include <Arduino.h>
+#ifndef VIETHUD_P4
 #include <driver/i2s.h>
+#endif
 #include <math.h>
 #include <string.h>
 #include <SD_MMC.h>
+#include "map/SdCardManager.h" // sdMgrDataFs(): card, or P4 flash fallback
 #include <AudioFileSourceFS.h>
 #include <AudioGeneratorMP3.h>
+#ifdef VIETHUD_P4
+#include "AudioOutP4.h" // ES8311 + i2s_std channel shared by tones and mp3
+#else
 #include <AudioOutputI2S.h>
+#endif
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
 
+#ifndef VIETHUD_P4
 #define I2S_PORT        I2S_NUM_0
 #define I2S_SAMPLE_RATE 16000
 #define I2S_BCLK_PIN    42
 #define I2S_LRCK_PIN    2
 #define I2S_DOUT_PIN    41
+#endif
+#ifdef VIETHUD_P4
+#define I2S_SAMPLE_RATE 16000
+#endif
 
 // Extra digital gain on the decoded VOICE stream, on top of the 0-100% volume.
 // The spoken clips are mastered well below full scale, so at 100% volume they
@@ -63,6 +75,15 @@ static void audioTaskFn(void *); // defined below
 // after ESP8266Audio's AudioOutputI2S releases the port — see that
 // function's own comment for why the two APIs can't share it
 // simultaneously.
+#ifdef VIETHUD_P4
+static bool installToneI2S() { return p4AudioSetRate(I2S_SAMPLE_RATE); }
+// Mono tone chunk -> interleaved L/R on the shared stereo channel.
+static void toneWrite(const int16_t *mono, int n) {
+    int16_t st[256];
+    for (int i = 0; i < n; i++) st[2 * i] = st[2 * i + 1] = mono[i];
+    p4AudioWrite(st, n);
+}
+#else
 static bool installToneI2S() {
     i2s_config_t i2s_config = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
@@ -98,6 +119,7 @@ static bool installToneI2S() {
     }
     return true;
 }
+#endif
 
 void audioInit() {
     if (s_initialized) return;
@@ -111,10 +133,14 @@ void audioInit() {
             xTaskCreatePinnedToCore(audioTaskFn, "audioTask", 6144, NULL, 1, NULL, 0);
         }
     }
+#ifdef VIETHUD_P4
+    if (p4AudioBegin() && installToneI2S()) s_initialized = true;
+#else
     if (installToneI2S()) {
         s_initialized = true;
         Serial.println("[audio] NS4168 I2S audio driver initialized on BCLK=42, LRCK=2, DOUT=41");
     }
+#endif
 }
 
 void audioSetVolume(uint8_t percent) {
@@ -159,15 +185,23 @@ void audioPlayTone(uint16_t freqHz, uint16_t durationMs) {
             phase += phaseInc;
             if (phase >= 2.0f * (float)M_PI) phase -= 2.0f * (float)M_PI;
         }
+#ifdef VIETHUD_P4
+        toneWrite(buffer, chunk);
+#else
         size_t bytesWritten = 0;
         i2s_write(I2S_PORT, buffer, chunk * sizeof(int16_t), &bytesWritten, portMAX_DELAY);
+#endif
         samplesRemaining -= chunk;
     }
 
     // Flush small silent buffer at the end to prevent click
     memset(buffer, 0, sizeof(buffer));
+#ifdef VIETHUD_P4
+    toneWrite(buffer, 64);
+#else
     size_t bw = 0;
     i2s_write(I2S_PORT, buffer, 64 * sizeof(int16_t), &bw, portMAX_DELAY);
+#endif
     if (s_i2sMutex) xSemaphoreGive(s_i2sMutex);
 }
 
@@ -278,13 +312,19 @@ static void audioTaskFn(void *) {
         Serial.printf("[audio] playing voice: %s\n", path);
 
         if (s_i2sMutex) xSemaphoreTake(s_i2sMutex, portMAX_DELAY);
+#ifndef VIETHUD_P4
         i2s_driver_uninstall(I2S_PORT);
         s_initialized = false;
+#endif
 
-        AudioFileSourceFS source(SD_MMC, path);
+        AudioFileSourceFS source(sdMgrDataFs(), path); // SD card, or P4 flash fallback
         if (source.isOpen()) {
+#ifdef VIETHUD_P4
+            AudioOutputP4 out;
+#else
             AudioOutputI2S out;
             out.SetPinout(I2S_BCLK_PIN, I2S_LRCK_PIN, I2S_DOUT_PIN);
+#endif
             out.SetGain((float)s_volume / 100.0f * VOICE_GAIN_BOOST);
             AudioGeneratorMP3 mp3;
             if (mp3.begin(&source, &out)) {
@@ -299,7 +339,11 @@ static void audioTaskFn(void *) {
             Serial.printf("[audio] voice: file not found: %s\n", path);
         }
 
+#ifdef VIETHUD_P4
+        installToneI2S(); // back to the tone rate; the channel itself stays up
+#else
         if (installToneI2S()) s_initialized = true;
+#endif
         if (s_i2sMutex) xSemaphoreGive(s_i2sMutex);
     }
 }

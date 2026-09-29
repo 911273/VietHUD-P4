@@ -1,6 +1,35 @@
 #pragma once
-#include <Arduino_GFX_Library.h>
 #include <lvgl.h>
+
+#ifdef VIETHUD_P4
+// ESP32-P4 / JC4880P443C (display/DisplayDriverP4.cpp): ST7701S 480x800
+// MIPI-DSI panel. LVGL still renders at the S3 UI's own logical size
+// (320x480 portrait / 480x320 landscape per cfg.screenRotation) and the flush
+// callback scales it x1.5 (+ rotation) into the DPI framebuffer with the PPA,
+// so every layout in ui/ is reused unchanged. The UI only ever asks `gfx`
+// for width()/height(), so on this board `gfx` is just that logical size.
+struct LogicalDisplay {
+    int w = 320, h = 480;
+    int width() const { return w; }
+    int height() const { return h; }
+};
+extern LogicalDisplay *gfx;
+
+// Creates the LVGL display at the panel's native resolution (DIRECT mode,
+// PSRAM frame, PPA rotate + vsync double buffering) — call after displayBegin().
+lv_display_t *displayCreateLvgl();
+int displayPhysWidth();  // LVGL resolution: 800x480 landscape / 480x800 portrait
+int displayPhysHeight();
+const uint16_t *displayFrame(); // the full current LVGL frame (serial 'P' screenshot)
+// Flicker diagnostics (serial 'Z'): freeze presentation / steady non-PWM backlight.
+void displaySetFrozen(bool on);
+void displayTraceFrames(int n); // serial 'F': log the next n presented frames
+void displaySetBacklightSteady(bool on);
+// Physical panel point (GT911, native portrait) -> LVGL point.
+bool displayPanelToLogical(int px, int py, uint16_t *lx, uint16_t *ly);
+#else
+#include <Arduino_GFX_Library.h>
+#endif
 
 // Whole-frame Canvas-based display driver for the JC3248W535 AXS15231B panel.
 // See docs/V1.2_hardening_proposal.md "Lỗi phần cứng driver AXS15231B":
@@ -22,7 +51,9 @@
 // inline) because it needs cfg.screenRotation, which isn't loaded from NVS
 // until loadConfigFromNVS() runs partway through setup() — displayBegin()
 // constructs it, not this header's static initialization.
+#ifndef VIETHUD_P4
 extern Arduino_Canvas *gfx;
+#endif
 
 // Running totals for the [perf] report in loop() — microseconds spent per
 // flush cycle copying into the Canvas RAM buffer (renderUs) vs. the actual

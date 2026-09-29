@@ -1725,6 +1725,21 @@ static void speedLimitTaskFn(void *) {
             }
         }
         if (ri.mapLoaded) {
+#ifdef VIETHUD_P4
+            // P4 (800x480): the 2 Hz map refresh the matcher's 500 ms loop gave
+            // made the map jump ~8 m at 60 km/h — read as flicker on the big
+            // panel (2026-09-29). Matching stays at 500 ms; in between, this
+            // same task (it owns the tile cache) refreshes only the map layer
+            // every 100 ms.
+            static uint32_t sLastMatchMs = 0;
+            if (millis() - sLastMatchMs < 500) {
+                mapRendererUpdate(gnssSnapshot());
+                esp_task_wdt_reset();
+                vTaskDelay(pdMS_TO_TICKS(100));
+                continue;
+            }
+            sLastMatchMs = millis();
+#endif
             GnssSnapshot gnss = gnssSnapshot();
             RoadInfoSnapshot out;
             uint32_t tTick0 = micros();
@@ -1848,7 +1863,11 @@ static void speedLimitTaskFn(void *) {
         // idle once mapLoaded is permanently false (can't become true again
         // without a reboot), same idle-slower reasoning
         // net/WebPortal.cpp's webTaskFn uses for its own OFF-state delay.
+#ifdef VIETHUD_P4
+        vTaskDelay(pdMS_TO_TICKS(ri.mapLoaded ? 100 : 2000)); // map-only ticks between matches (see top of loop)
+#else
         vTaskDelay(pdMS_TO_TICKS(ri.mapLoaded ? 500 : 2000));
+#endif
     }
 }
 

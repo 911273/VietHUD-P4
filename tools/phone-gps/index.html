@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>VietHUD GPS</title>
+<!--
+  VietHUD phone GPS bridge (2026-09-29). Zero cost on iPhone:
+  open this page (must be HTTPS) in the free "Bluefy – Web BLE Browser" app
+  (Safari has no Web Bluetooth). It reads the phone's GPS and sends it to
+  VietHUD as NMEA ($GPRMC + $GPGGA) over BLE Nordic UART, where it feeds the
+  same parser as the GPS module (src/net/PhoneGpsBle.h in the firmware).
+  Works on Android Chrome too (Web Bluetooth is built in there).
+-->
+<style>
+  :root { --bg:#0b0f14; --card:#141b24; --fg:#e6edf3; --dim:#8a98a8; --ok:#34c46a; --warn:#e8b931; --bad:#ff3b30; --acc:#3da5ff; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.4 -apple-system, system-ui, sans-serif;
+         padding: max(16px, env(safe-area-inset-top)) 16px 24px; }
+  h1 { font-size:20px; margin:0 0 12px; }
+  .card { background:var(--card); border-radius:14px; padding:14px 16px; margin-bottom:12px; }
+  .row { display:flex; justify-content:space-between; gap:12px; padding:4px 0; }
+  .row span:first-child { color:var(--dim); }
+  .big { font-size:56px; font-weight:700; text-align:center; line-height:1.1; }
+  .unit { font-size:18px; color:var(--dim); text-align:center; }
+  button { width:100%; font-size:18px; padding:14px; border:0; border-radius:12px; background:var(--acc); color:#fff; margin-top:8px; }
+  button.sec { background:#2a3441; }
+  .dot { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:8px; background:var(--dim); }
+  .ok { background:var(--ok); } .warn { background:var(--warn); } .bad { background:var(--bad); }
+  #log { font:12px/1.35 ui-monospace, Menlo, monospace; color:var(--dim); white-space:pre-wrap; max-height:140px; overflow:auto; }
+  .note { color:var(--dim); font-size:13px; }
+</style>
+</head>
+<body>
+<h1>VietHUD – GPS từ điện thoại</h1>
+
+<div class="card">
+  <div class="row"><span>Bluetooth</span><span><i id="bleDot" class="dot"></i><b id="bleTxt">Chưa kết nối</b></span></div>
+  <div class="row"><span>GPS điện thoại</span><span><i id="gpsDot" class="dot"></i><b id="gpsTxt">Chưa bật</b></span></div>
+  <button id="btn">Kết nối VietHUD</button>
+</div>
+
+<div class="card">
+  <div class="big" id="spd">--</div>
+  <div class="unit">km/h</div>
+  <div class="row"><span>Hướng</span><b id="hdg">--</b></div>
+  <div class="row"><span>Sai số vị trí</span><b id="acc">--</b></div>
+  <div class="row"><span>Đã gửi</span><b id="cnt">0</b></div>
+</div>
+
+<div class="card">
+  <div class="note">Giữ ứng dụng mở trên màn hình khi lái xe (iOS dừng web khi chạy nền). Màn hình được giữ sáng tự động.</div>
+  <div id="log"></div>
+</div>
+
+<script>
+const NUS = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const RX  = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
+const $ = id => document.getElementById(id);
+let device = null, rxChar = null, watchId = null, sent = 0, wantConnected = false, last = null, lastSend = 0;
+
+function log(m) { const l = $('log'); l.textContent = new Date().toLocaleTimeString() + '  ' + m + '\n' + l.textContent.slice(0, 3000); }
+function setBle(state, text) { $('bleDot').className = 'dot ' + state; $('bleTxt').textContent = text; }
+function setGps(state, text) { $('gpsDot').className = 'dot ' + state; $('gpsTxt').textContent = text; }
+
+// ---- NMEA ----
+function cks(s) { let c = 0; for (const ch of s) c ^= ch.charCodeAt(0); return c.toString(16).toUpperCase().padStart(2, '0'); }
+function dm(v, isLat) {
+  const a = Math.abs(v), d = Math.floor(a), m = (a - d) * 60;
+  const ds = String(d).padStart(isLat ? 2 : 3, '0'), ms = m.toFixed(5).padStart(8, '0');
+  return [ds + ms, isLat ? (v >= 0 ? 'N' : 'S') : (v >= 0 ? 'E' : 'W')];
+}
+function p2(n) { return String(n).padStart(2, '0'); }
+function nmea(lat, lon, kmh, hdg, accM, t) {
+  const hms = p2(t.getUTCHours()) + p2(t.getUTCMinutes()) + p2(t.getUTCSeconds()) + '.' + p2(Math.floor(t.getUTCMilliseconds() / 10));
+  const dmy = p2(t.getUTCDate()) + p2(t.getUTCMonth() + 1) + p2(t.getUTCFullYear() % 100);
+  const [la, ns] = dm(lat, true), [lo, ew] = dm(lon, false);
+  const kn = kmh == null ? '' : (kmh / 1.852).toFixed(2);
+  const crs = hdg == null ? '' : hdg.toFixed(1);
+  const rmc = `GPRMC,${hms},A,${la},${ns},${lo},${ew},${kn},${crs},${dmy},,,A`;
+  const hdop = Math.max(0.5, Math.min(20, (accM || 5) / 5)).toFixed(1); // rough: iOS gives metres, not DOP
+  const gga = `GPGGA,${hms},${la},${ns},${lo},${ew},1,00,${hdop},,M,,M,,`;
+  return `$${rmc}*${cks(rmc)}\r\n$${gga}*${cks(gga)}\r\n`;
+}
+
+// ---- speed/heading fallback when iOS reports null/-1 ----
+function derive(pos) {
+  const c = pos.coords;
+  let kmh = (c.speed != null && c.speed >= 0) ? c.speed * 3.6 : null;
+  let hdg = (c.heading != null && !isNaN(c.heading) && c.heading >= 0) ? c.heading : null;
+  if (last && (kmh == null || hdg == null)) {
+    const dt = (pos.timestamp - last.timestamp) / 1000;
+    if (dt > 0.2) {
+      const R = 6371000, toR = Math.PI / 180;
+      const dy = (c.latitude - last.coords.latitude) * toR * R;
+      const dx = (c.longitude - last.coords.longitude) * toR * R * Math.cos(c.latitude * toR);
+      const d = Math.hypot(dx, dy);
+      if (kmh == null) kmh = d / dt * 3.6;
+      if (hdg == null && d > 2) hdg = (Math.atan2(dx, dy) / toR + 360) % 360;
+    }
+  }
+  if (hdg != null && kmh != null && kmh < 3) hdg = null; // heading is noise when stopped
+  return { kmh, hdg };
+}
+
+// ---- BLE ----
+async function write(str) {
+  if (!rxChar) return;
+  const bytes = new TextEncoder().encode(str);
+  for (let i = 0; i < bytes.length; i += 20) {              // 20-byte chunks work at any MTU
+    const part = bytes.slice(i, i + 20);
+    if (rxChar.writeValueWithoutResponse) await rxChar.writeValueWithoutResponse(part);
+    else await rxChar.writeValue(part);
+  }
+}
+async function gattConnect() {
+  setBle('warn', 'Đang kết nối…');
+  const server = await device.gatt.connect();
+  const svc = await server.getPrimaryService(NUS);
+  rxChar = await svc.getCharacteristic(RX);
+  setBle('ok', 'Đã kết nối ' + (device.name || 'VietHUD'));
+  log('BLE connected');
+}
+async function onDisconnected() {
+  rxChar = null;
+  setBle('bad', 'Mất kết nối – đang thử lại');
+  log('BLE disconnected');
+  for (let i = 0; wantConnected && i < 1000; i++) {
+    await new Promise(r => setTimeout(r, Math.min(10000, 1000 * (i + 1))));
+    try { await gattConnect(); return; } catch (e) { log('retry: ' + e.message); }
+  }
+}
+async function connect() {
+  try {
+    device = await navigator.bluetooth.requestDevice({ filters: [{ services: [NUS] }, { namePrefix: 'VietHUD' }], optionalServices: [NUS] });
+    device.addEventListener('gattserverdisconnected', onDisconnected);
+    wantConnected = true;
+    await gattConnect();
+    startGps();
+    keepAwake();
+    $('btn').textContent = 'Ngắt kết nối';
+    $('btn').className = 'sec';
+  } catch (e) { setBle('bad', 'Lỗi: ' + e.message); log(e.message); }
+}
+function disconnect() {
+  wantConnected = false;
+  if (watchId != null) navigator.geolocation.clearWatch(watchId);
+  watchId = null;
+  if (device && device.gatt.connected) device.gatt.disconnect();
+  setBle('', 'Chưa kết nối'); setGps('', 'Đã tắt');
+  $('btn').textContent = 'Kết nối VietHUD'; $('btn').className = '';
+}
+
+// ---- GPS ----
+function startGps() {
+  if (!navigator.geolocation) { setGps('bad', 'Không hỗ trợ'); return; }
+  setGps('warn', 'Đang tìm vị trí…');
+  watchId = navigator.geolocation.watchPosition(async pos => {
+    const c = pos.coords, { kmh, hdg } = derive(pos);
+    last = pos;
+    setGps(c.accuracy <= 20 ? 'ok' : 'warn', '±' + Math.round(c.accuracy) + ' m');
+    $('spd').textContent = kmh == null ? '--' : Math.round(kmh);
+    $('hdg').textContent = hdg == null ? '--' : Math.round(hdg) + '°';
+    $('acc').textContent = '±' + Math.round(c.accuracy) + ' m';
+    if (Date.now() - lastSend < 400) return; // iOS can burst; ~1-2 Hz is plenty
+    lastSend = Date.now();
+    try { await write(nmea(c.latitude, c.longitude, kmh, hdg, c.accuracy, new Date(pos.timestamp))); $('cnt').textContent = ++sent; }
+    catch (e) { log('write: ' + e.message); }
+  }, err => { setGps('bad', err.message); log('GPS: ' + err.message); },
+  { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 });
+}
+
+// ---- keep the screen on (iOS suspends background web pages) ----
+async function keepAwake() {
+  try { if (navigator.bluetooth && navigator.bluetooth.setScreenDimEnabled) navigator.bluetooth.setScreenDimEnabled(false); } catch (e) {}
+  try { if (navigator.wakeLock) await navigator.wakeLock.request('screen'); } catch (e) {}
+}
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && wantConnected) keepAwake(); });
+
+$('btn').onclick = () => (wantConnected ? disconnect() : connect());
+if (!navigator.bluetooth) { setBle('bad', 'Trình duyệt không có Web Bluetooth – hãy mở trong app Bluefy'); $('btn').disabled = true; }
+</script>
+</body>
+</html>

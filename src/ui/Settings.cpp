@@ -9,6 +9,7 @@
 #include "net/DataUpdater.h"  // dataUpdateStart()/GetStatus() — WiFi tab "Update data" button
 #include "net/UpdateApi.h"    // updateApiBusy() — a phone is pushing data right now
 #include "update/DataInstaller.h" // installerProgress() — phone->device transfer progress
+#include "touch/TouchTask.h"      // gTouchCalRequested (P4 touch calibration button)
 #include <string.h>
 
 // ---------------------------------------------------------------------
@@ -1219,6 +1220,18 @@ void buildSettingsScreen() {
     // known stuck-bus quirk (2026-09-14) during the user's own testing.
     static const char *kRotationLabels[4] = {"0", "90", "180", "270"};
     addChoiceRow(categoryPanels[0], y, "Rotation", &cfg.screenRotation, kRotationLabels, 4);
+#ifdef VIETHUD_P4
+    { // 5-point touch calibration (touch/TouchTaskP4.cpp); runs from the main loop
+        lv_obj_t *btn = lv_button_create(categoryPanels[0]);
+        lv_obj_set_pos(btn, 4, y + 4);
+        lv_obj_set_size(btn, 220, 34);
+        lv_obj_t *l = lv_label_create(btn);
+        lv_label_set_text(l, "Hiệu chuẩn cảm ứng");
+        lv_obj_center(l);
+        lv_obj_add_event_cb(btn, [](lv_event_t *) { gTouchCalRequested = true; }, LV_EVENT_CLICKED, NULL);
+        y += 44;
+    }
+#endif
 
     // Audio tab (categoryPanels[4], 2026-09-26): master switch + volume, then
     // which alert types speak. Holding the Dashboard ~2.5 s flips the master.

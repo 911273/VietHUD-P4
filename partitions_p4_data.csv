@@ -1,0 +1,10 @@
+# VietHUD on ESP32-P4 (JC4880P443C, 16MB flash): one 3MB app slot + a 13.5MB
+# FAT partition holding the core speedmap data (map tiles, cameras, signs,
+# names, voice prompts ~12MB) so the board runs without a microSD card.
+# A card, when present, still takes priority (map/SdCardManager.cpp).
+# Name,   Type, SubType,  Offset,   Size
+nvs,      data, nvs,      0x9000,   0x5000
+otadata,  data, ota,      0xe000,   0x2000
+app0,     app,  ota_0,    0x10000,  0x300000
+ffat,     data, fat,      0x310000, 0xCE0000
+coredump, data, coredump, 0xFF0000, 0x10000

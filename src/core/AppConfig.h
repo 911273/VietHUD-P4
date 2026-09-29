@@ -158,7 +158,11 @@ struct AppConfig {
     // take effect live (see ui/Settings.cpp's rotation row): both Dashboard
     // and Settings are laid out once at boot for whichever orientation is
     // active then, so a change only applies on the next restart.
+#ifdef VIETHUD_P4
+    float screenRotation = 1; // P4 board (480x800 portrait panel) is mounted landscape
+#else
     float screenRotation = 0;
+#endif
     // themeMode: 0=Auto (today's only behavior — ui/Dashboard.cpp's
     // applyTheme() follows gnss.daytime's real sunrise/sunset calculation),
     // 1=Light, 2=Dark (both override gnss.daytime rather than replacing the

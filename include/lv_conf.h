@@ -520,17 +520,29 @@
 #define LV_FONT_MONTSERRAT_16 0
 #define LV_FONT_MONTSERRAT_18 0
 #define LV_FONT_MONTSERRAT_20 1 // enabled 2026-09-25 for the bigger compass/heading letter (Dashboard.cpp)
+#ifdef VIETHUD_P4 /* 1.5x of 14/20/28 for the P4 native-res UI */
+#define LV_FONT_MONTSERRAT_22 1
+#else
 #define LV_FONT_MONTSERRAT_22 0
+#endif
 #define LV_FONT_MONTSERRAT_24 1
 #define LV_FONT_MONTSERRAT_26 0
 #define LV_FONT_MONTSERRAT_28 1
+#ifdef VIETHUD_P4 /* 1.5x of 14/20/28 for the P4 native-res UI */
+#define LV_FONT_MONTSERRAT_30 1
+#else
 #define LV_FONT_MONTSERRAT_30 0
+#endif
 #define LV_FONT_MONTSERRAT_32 1 // enabled 2026-09-21 for Dashboard.cpp's speedLimitValueLabel � user-requested "tang kich thuoc cac so hien thi len nua"
 #define LV_FONT_MONTSERRAT_34 0
 #define LV_FONT_MONTSERRAT_36 1 // enabled 2026-09-16 for Dashboard.cpp's landscape speedLabel � user-requested bigger ego-speed number
 #define LV_FONT_MONTSERRAT_38 0
 #define LV_FONT_MONTSERRAT_40 0
+#ifdef VIETHUD_P4 /* 1.5x of 14/20/28 for the P4 native-res UI */
+#define LV_FONT_MONTSERRAT_42 1
+#else
 #define LV_FONT_MONTSERRAT_42 0
+#endif
 #define LV_FONT_MONTSERRAT_44 0
 #define LV_FONT_MONTSERRAT_46 0
 #define LV_FONT_MONTSERRAT_48 1 // enabled 2026-09-16 for Dashboard.cpp's Simple-layout primaryDistLabel � user-requested "con so khoang cach to hon nua"
@@ -548,14 +560,22 @@
 /*Optionally declare custom fonts here.
  *You can use these fonts as default font too and they will be available globally.
  *E.g. #define LV_FONT_CUSTOM_DECLARE   LV_FONT_DECLARE(my_font_1) LV_FONT_DECLARE(my_font_2)*/
+#ifdef VIETHUD_P4
+#define LV_FONT_CUSTOM_DECLARE   LV_FONT_DECLARE(lv_font_vn_21)
+#else
 #define LV_FONT_CUSTOM_DECLARE   LV_FONT_DECLARE(lv_font_vn_14)
+#endif
 
 /*Always set a default font. lv_font_vn_14 (2026-09-24) = Arial 14px with the
  *full Vietnamese repertoire + ASCII, a metric drop-in for montserrat_14
  *(same line_height 16). Making it the DEFAULT gives every label that doesn't
  *set an explicit font (sign banners, Settings rows, ahead-limit) Vietnamese
  *diacritics for free. See tools/fonts/gen_vn_font.py.*/
+#ifdef VIETHUD_P4 /* UI drawn at 1.5x on the 800x480 panel: vn_21 = 1.5 x vn_14 */
+#define LV_FONT_DEFAULT &lv_font_vn_21
+#else
 #define LV_FONT_DEFAULT &lv_font_vn_14
+#endif
 
 /*Enable handling large font and/or fonts with a lot of characters.
  *The limit depends on the font size, font face and bpp.

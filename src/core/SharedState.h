@@ -33,6 +33,7 @@ struct GnssSnapshot {
     bool altitudeValid = false;
     float hdop = 0;       // horizontal dilution of precision (0 = unknown); jumps under viaducts
     uint32_t fixSeq = 0;  // increments on every NEW position fix (the matcher's HMM steps once per fix)
+    bool fromPhone = false; // P4: fix comes from the phone over BLE (net/PhoneGpsBle.h), badge "PHONE"
     // Sunrise/sunset estimate from GNSS date+time+position (spec section
     // 15.2: "no light sensor" — this IS that calculation). Only meaningful
     // when timeValid; defaults true (sun) so a not-yet-fixed clock icon

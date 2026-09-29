@@ -45,6 +45,10 @@
 #include "core/SharedState.h"
 #include "display/DisplayDriver.h"
 #include "gnss/GNSS.h"
+#include "gnss/RoadSim.h"
+#ifdef VIETHUD_P4
+#include "net/PhoneGpsBle.h"
+#endif
 #include "map/SpeedLimitManager.h"
 #include "map/SdCardManager.h"
 #include "log/TripLogger.h"
@@ -397,7 +401,14 @@ void setup() {
     // hang confirmed 2026-09-14 blocked loop() outright with no error ever
     // returned). If loop() doesn't come back around to feed this within 5s,
     // the watchdog panics and reboots instead of freezing forever.
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+    { // IDF 5: the core already created the TWDT — reconfigure it (10 s, panic)
+        esp_task_wdt_config_t wc = {.timeout_ms = 10000, .idle_core_mask = 0, .trigger_panic = true};
+        esp_task_wdt_reconfigure(&wc);
+    }
+#else
     esp_task_wdt_init(10, true);
+#endif
     esp_task_wdt_add(NULL);
 
     loadConfigFromNVS(cfg);
@@ -414,6 +425,11 @@ void setup() {
     audioPlayStartupJingle();
 
     lv_init();
+#ifdef VIETHUD_P4
+    // P4: native-resolution display (DIRECT mode, PSRAM frame, PPA rotation
+    // into vsync-swapped double framebuffers) — see display/DisplayDriverP4.cpp.
+    lvDisplay = displayCreateLvgl();
+#else
     lvDisplay = lv_display_create(gfx->width(), gfx->height());
     lv_display_set_flush_cb(lvDisplay, dispFlushCb);
 
@@ -436,6 +452,7 @@ void setup() {
         drawBuf2 = (lv_color_t *)heap_caps_malloc(bufBytes, MALLOC_CAP_SPIRAM);
     }
     lv_display_set_buffers(lvDisplay, drawBuf1, drawBuf2, bufBytes, LV_DISPLAY_RENDER_MODE_PARTIAL);
+#endif
 
     lvTouchIndev = lv_indev_create();
     lv_indev_set_type(lvTouchIndev, LV_INDEV_TYPE_POINTER);
@@ -465,6 +482,11 @@ void setup() {
     buildDashboard();
     buildSettingsScreen();
     showBootSplash(); // ~2s animated VRE logo, then cross-fades to the Dashboard (blocking)
+#ifdef VIETHUD_P4
+    // First boot on this panel / after a rotation change: calibrate touch
+    // (gives up after 30 s untouched, keeping the nominal mapping).
+    if (!touchCalValid()) touchCalibrationRun(true);
+#endif
     // Welcome greeting AFTER the splash has finished (user-requested 2026-09-25):
     // the spoken "chào mừng" now plays once the dashboard is on screen, not over
     // the logo animation. SD is already mounted above, so the clip is available.
@@ -472,6 +494,9 @@ void setup() {
 
     sharedStateInit();
     gnssTaskStart();  // Core 0 — real GNSS M10N on UART2
+#ifdef VIETHUD_P4
+    phoneGpsBleStart(); // BLE (via the C6): phone GPS as NMEA over Nordic UART — net/PhoneGpsBle.h
+#endif
     webPortalInit(); // Core 0 — WiFi AP + local web server, starts with WiFi OFF — see net/WebPortal.h
     // Just rebooted to install data pushed from a phone: bring the hotspot back
     // so the phone reconnects and its portal page can show the result.
@@ -497,6 +522,58 @@ void setup() {
 // loop() confirms it after kHealthyAfterMs of normal running; a crash/reset
 // before that boots the previous firmware again. (C linkage: overrides the weak
 // default in esp32-hal-misc.c.)
+#ifdef VIETHUD_P4
+// Flicker diagnostic (serial 'Z', 2026-09-29): cycles A/B/C twice, 15 s each,
+// with the phase letter shown large in the top-right corner so the person
+// looking at the panel can say which phases flicker:
+//   A = normal rendering, B = presentation frozen on one frame (isolates the
+//   render/swap pipeline), C = everything running except the map redraw
+//   (isolates the map layer). v1 of C was "steady backlight"; the backlight
+//   is now a steady HIGH at 100% anyway (DisplayDriverP4 backlightWrite).
+extern volatile bool gMapPaused; // ui/Dashboard.cpp
+static int sDiagPhase = -1;
+static uint32_t sDiagT0 = 0, sDiagPhaseT0 = 0;
+static lv_obj_t *sDiagLbl = nullptr;
+static void flickerDiagStart() {
+    sDiagT0 = millis();
+    sDiagPhase = -1;
+    if (!sDiagLbl) {
+        sDiagLbl = lv_label_create(lv_layer_top());
+        lv_obj_set_style_text_font(sDiagLbl, &lv_font_montserrat_48, 0);
+        lv_obj_set_style_text_color(sDiagLbl, lv_color_hex(0xFFD400), 0);
+        lv_obj_set_style_bg_color(sDiagLbl, lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(sDiagLbl, LV_OPA_70, 0);
+        lv_obj_set_style_pad_all(sDiagLbl, 6, 0);
+        lv_obj_align(sDiagLbl, LV_ALIGN_TOP_RIGHT, -8, 36);
+    }
+    lv_obj_clear_flag(sDiagLbl, LV_OBJ_FLAG_HIDDEN);
+    Serial.println("[diag] flicker test: A=normal B=frozen C=map paused, 15 s each, x2");
+}
+static void flickerDiagTick() {
+    if (!sDiagLbl || lv_obj_has_flag(sDiagLbl, LV_OBJ_FLAG_HIDDEN)) return;
+    uint32_t el = millis() - sDiagT0;
+    int ph = (int)(el / 15000);
+    if (ph >= 6) {
+        displaySetFrozen(false);
+        gMapPaused = false;
+        lv_obj_add_flag(sDiagLbl, LV_OBJ_FLAG_HIDDEN);
+        Serial.println("[diag] flicker test done");
+        return;
+    }
+    if (ph != sDiagPhase) {
+        sDiagPhase = ph;
+        sDiagPhaseT0 = millis();
+        static const char *kL[3] = {"A", "B", "C"};
+        lv_label_set_text(sDiagLbl, kL[ph % 3]);
+        displaySetFrozen(false);
+        gMapPaused = (ph % 3 == 2);
+        Serial.printf("[diag] phase %s\n", kL[ph % 3]);
+    }
+    // Phase B: let one frame with the "B" label reach the panel, then freeze.
+    if (sDiagPhase % 3 == 1 && millis() - sDiagPhaseT0 > 400) displaySetFrozen(true);
+}
+#endif
+
 extern "C" bool verifyRollbackLater() { return true; }
 static const uint32_t kHealthyAfterMs = 30000;
 
@@ -579,9 +656,32 @@ void loop() {
                 wl[n] = a; wo[n] = b; n++;
             }
             if (n >= 2) gnssSimRoute(wl, wo, n, kmh);
+        } else if (c == 'R') {
+            // Road-following sim (gnss/RoadSim.h): "R lat lon [speedFactor]"
+            // drives on real roads from there; a bare "R" stops it.
+            String line = Serial.readStringUntil('\n');
+            float a = 0, b = 0, f = 1.0f;
+            int n = sscanf(line.c_str(), "%f %f %f", &a, &b, &f);
+            if (n >= 2) roadSimRequestStart(a, b, n >= 3 ? f : 1.0f);
+            else roadSimRequestStop();
         } else if (c == 'P') {
             // Bench: screenshot of the active screen as raw RGB565 over serial.
+#ifdef VIETHUD_P4
+            // DIRECT-mode frame is the whole current screen already (a 768KB
+            // lv_snapshot_take would not fit the LVGL pool).
+            {
+                const uint16_t *fr = displayFrame();
+                int fw = displayPhysWidth(), fh = displayPhysHeight();
+                Serial.printf("[snap] %d %d %d\n", fw, fh, fw * 2);
+                Serial.flush();
+                Serial.write((const uint8_t *)fr, (size_t)fw * fh * 2);
+                Serial.flush();
+                Serial.println("\n[snap] end");
+            }
+            lv_draw_buf_t *snap = nullptr;
+#else
             lv_draw_buf_t *snap = lv_snapshot_take(lv_screen_active(), LV_COLOR_FORMAT_RGB565);
+#endif
             if (snap) {
                 Serial.printf("[snap] %u %u %u\n", (unsigned)snap->header.w, (unsigned)snap->header.h,
                               (unsigned)snap->header.stride);
@@ -590,9 +690,12 @@ void loop() {
                 Serial.flush();
                 Serial.println("\n[snap] end");
                 lv_draw_buf_destroy(snap);
-            } else {
+            }
+#ifndef VIETHUD_P4
+            else {
                 Serial.println("[snap] failed (out of memory)");
             }
+#endif
         } else if (c == 'u') {
             // Bench trigger for the OTA data update. Uses the SAME reliable path
             // as the web + on-screen buttons: set the NVS flag and reboot into
@@ -602,7 +705,23 @@ void loop() {
             Serial.println("[debug] data update requested via serial -> scheduling reboot to update mode");
             dataUpdateSchedule(); // sets flag, then ESP.restart()
         }
+#ifdef VIETHUD_P4
+        else if (c == 'F') {
+            displayTraceFrames(40);
+        } else if (c == 'Z') {
+            flickerDiagStart();
+        } else if (c == 'K') {
+            gTouchCalRequested = true; // run outside LVGL callbacks, below
+        }
+#endif
     }
+#ifdef VIETHUD_P4
+    flickerDiagTick();
+    if (gTouchCalRequested) {
+        gTouchCalRequested = false;
+        touchCalibrationRun(false);
+    }
+#endif
 
     uint32_t now = millis();
     lv_tick_inc(now - lastTick);

@@ -1,5 +1,40 @@
 #pragma once
 
+#ifdef VIETHUD_P4
+// Guition JC4880P443C (ESP32-P4 rev v3.2 + ESP32-C6) — pin map read LIVE from
+// the board's GPIO/IO_MUX registers while its factory fw ran (2026-09-29,
+// esp32p4_board/hw_profile.db) and cross-checked against the board
+// schematic (github.com/ultramcu/guition-jc4880p443c-i-w).
+// Display is MIPI-DSI (dedicated pins); only reset/backlight are GPIOs.
+#define LCD_RST_PIN   5   // ST7701S reset, active low
+#define TFT_BL        23  // backlight PWM (LEDC) -> MP3202 boost enable
+#define LCD_PANEL_W   480 // native portrait
+#define LCD_PANEL_H   800
+// Touch GT911 + ES8311 codec share one I2C bus (Wire)
+#define TOUCH_SDA     7
+#define TOUCH_SCL     8
+// Audio: ES8311 over I2S, NS4150 amp enable
+#define I2S_MCLK_PIN  13
+#define I2S_BCLK_PIN  12
+#define I2S_LRCK_PIN  10
+#define I2S_DOUT_PIN  9
+#define I2S_DIN_PIN   48
+#define PA_EN_PIN     11
+// microSD: SDMMC slot0 4-bit (IO_MUX pins); TF_VCC comes from on-chip LDO4
+#define SD_MMC_CLK_PIN 43
+#define SD_MMC_CMD_PIN 44
+#define SD_MMC_D0_PIN  39
+#define SD_MMC_D1_PIN  40
+#define SD_MMC_D2_PIN  41
+#define SD_MMC_D3_PIN  42
+#define SD_LDO_CHAN    4
+// GNSS (u-blox M10N, UART2) — not fitted yet; wire to expansion header JP1:
+// module TX -> GPIO30 (JP1 pin 10), module RX <- GPIO31 (JP1 pin 8),
+// 3V3 = JP1 pin 1 (or 5V = pin 2), GND = JP1 pin 6.
+#define GNSS_RX_PIN 30
+#define GNSS_TX_PIN 31
+#else
+
 // JC3248W535 (ESP32-S3-N16R8V) pin mapping — confirmed against real-world
 // Arduino_GFX/AXS15231B example projects for this exact board, matches
 // docs/radar_car_V1.1_spec.md section 19.
@@ -48,3 +83,4 @@
 #define SD_MMC_CLK_PIN 12
 #define SD_MMC_CMD_PIN 11
 #define SD_MMC_D0_PIN  13
+#endif // VIETHUD_P4

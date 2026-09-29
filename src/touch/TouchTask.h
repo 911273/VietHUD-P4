@@ -17,3 +17,10 @@ struct TouchPoint {
 // is currently there via touchSnapshot(), never touching the I2C bus itself.
 void touchTaskStart();
 TouchPoint touchSnapshot();
+
+#ifdef VIETHUD_P4
+// Touch calibration (touch/TouchTaskP4.cpp): 5-point affine fit, saved in NVS.
+extern volatile bool gTouchCalRequested; // set from UI/serial; main loop runs it
+bool touchCalValid();                     // calibration exists for the current rotation
+bool touchCalibrationRun(bool firstBoot); // blocking; firstBoot = give up after 30 s idle
+#endif

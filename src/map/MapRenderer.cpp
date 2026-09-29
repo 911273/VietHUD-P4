@@ -228,8 +228,15 @@ void mapRendererComputeFromSegments(const GnssSnapshot &gnss, const RoadSegment 
 // visibly spinning map) while the car sat still. Ignore heading below it so a
 // stopped/crawling car keeps a static map; the partial flush then makes those
 // frames nearly free. Position movement still updates the map normally.
+#ifdef VIETHUD_P4
+// Finer steps on the 800x480 panel (full-frame render ~55 ms + map ~35 ms
+// fits the 150 ms UI tick; the S3's 33 ms QSPI flush was why it stayed coarse).
+static const float kMinMoveM = 1.5f;
+static const float kMinTurnDeg = 1.5f;
+#else
 static const float kMinMoveM = 3.0f;
 static const float kMinTurnDeg = 3.0f;
+#endif
 static const float kHeadingMinSpeedKmh = 8.0f;
 // Near a standstill, GPS position also wanders (multipath) by several metres,
 // which kept re-firing the move gate and redrawing the whole map (full 33ms

@@ -14,7 +14,11 @@
 #include "audio/AudioPlayer.h"
 
 LV_FONT_DECLARE(lv_font_montserrat_speed); // big speed digits
+#ifdef VIETHUD_P4
+#include "driver/temperature_sensor.h" // IDF 5 driver — the legacy one aborts next to it
+#else
 #include "driver/temp_sensor.h" // ESP32-S3 die sensor with selectable range (readDieTempC)
+#endif
 LV_FONT_DECLARE(lv_font_vn_14); // Vietnamese-capable text font (Arial 14px, ASCII+VN); drop-in for montserrat_14
 LV_FONT_DECLARE(lv_font_vn_20); // same at 20px — landscape top bar (matches the 20px bottom-corner readouts)
 
@@ -176,7 +180,13 @@ static lv_obj_t *dashRoot; // everything sits in here so it can be pixel-shifted
 // anywhere (checked), but the shared/unprefixed names were flagged as a
 // real hazard for a future edit, so this rewrite renames the landscape set
 // to make that class of mistake impossible rather than just improbable.
+#ifdef VIETHUD_P4
+// P4 800x480 panel: design units x1.5 (ui/UiScale.h) -> 533x320 design screen;
+// the extra width goes to the map column.
+static const int LS_SCR_W = 533, LS_SCR_H = 320;
+#else
 static const int LS_SCR_W = 480, LS_SCR_H = 320;
+#endif
 static const int LS_TOP_H = 30, LS_BOTTOM_H = 26;
 // Split 50/50 (user-requested 2026-09-16, "chia doi man hinh... phan hien
 // thi xe sang 1 ben, nua man hinh con lai la cac thong so") — replaces the
@@ -226,6 +236,10 @@ static uint32_t lastDrawnMapGeneration = 0xFFFFFFFFu;
 static bool mapDimmed = false;
 static int egoAnchorX = 240, egoAnchorY = 213;
 static int gCanvasW = 480, gCanvasH = 320;
+#ifdef VIETHUD_P4
+// Native-resolution map layer (physical pixels) — see buildMapCanvas().
+static int gMapPhysW = 800, gMapPhysH = 480, gMapAnchorPX = 400, gMapAnchorPY = 240;
+#endif
 // Landscape status bars: top (GNSS / street / clock / WiFi / settings) and the
 // bottom one holding the heading letter + board temperature — both 20px text,
 // both marked by the same 1px line.
@@ -586,6 +600,47 @@ static void buildMapCanvas(lv_obj_t *parent, int w, int h) {
     if (refMin < 1) refMin = 1;
     gRefMinDim = refMin;
 
+#ifdef VIETHUD_P4
+    // P4: the map is its own native-resolution layer (800x480): a screen-
+    // sized canvas that is NOT rotated as a bitmap — updateMapCanvas() bakes
+    // the heading-up rotation into the vector coordinates instead, so roads
+    // stay crisp antialiased lines at any angle (the S3's nearest-neighbour
+    // bitmap rotation of a square canvas looked jagged). The MapRenderer
+    // square geometry (S, refMin) is computed in physical pixels too.
+    {
+        gMapPhysW = displayPhysWidth();
+        gMapPhysH = displayPhysHeight();
+        gMapAnchorPX = vhS(screenAnchorX);
+        gMapAnchorPY = vhS(screenAnchorY);
+        egoAnchorX = gMapAnchorPX; // edge fade works in physical screen space here
+        egoAnchorY = gMapAnchorPY;
+        float best = 0;
+        int xs[2] = {0, gMapPhysW}, ys[2] = {0, gMapPhysH};
+        for (int i = 0; i < 2; i++)
+            for (int j = 0; j < 2; j++) {
+                float dx = xs[i] - gMapAnchorPX, dy = ys[j] - gMapAnchorPY;
+                best = fmaxf(best, sqrtf(dx * dx + dy * dy));
+            }
+        S = ((int)ceilf(best) + 4) * 2;
+        gMapSideS = S;
+        gMapCenter = S / 2;
+        int rm = gMapAnchorPX;
+        rm = rm < gMapAnchorPY ? rm : gMapAnchorPY;
+        rm = rm < gMapPhysW - gMapAnchorPX ? rm : gMapPhysW - gMapAnchorPX;
+        rm = rm < gMapPhysH - gMapAnchorPY ? rm : gMapPhysH - gMapAnchorPY;
+        gRefMinDim = rm > 1 ? rm : 1;
+        size_t bytes = (size_t)gMapPhysW * gMapPhysH * sizeof(uint16_t);
+        mapCanvasBuf = (uint16_t *)heap_caps_aligned_alloc(64, bytes, MALLOC_CAP_SPIRAM);
+        mapCanvas = lv_canvas_create(parent);
+        lv_canvas_set_buffer(mapCanvas, mapCanvasBuf, gMapPhysW, gMapPhysH, LV_COLOR_FORMAT_RGB565);
+        (lv_obj_set_pos)(mapCanvas, 0, 0);
+        (lv_obj_set_size)(mapCanvas, gMapPhysW, gMapPhysH);
+        lv_canvas_fill_bg(mapCanvas, lv_color_hex(0x06080C), LV_OPA_COVER);
+        lv_obj_set_style_opa(mapCanvas, LV_OPA_COVER, 0);
+        lv_obj_clear_flag(mapCanvas, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clear_flag(mapCanvas, LV_OBJ_FLAG_CLICKABLE);
+    }
+#else
     size_t bufBytes = (size_t)S * (size_t)S * sizeof(uint16_t);
     mapCanvasBuf = (uint16_t *)heap_caps_malloc(bufBytes, MALLOC_CAP_SPIRAM);
     if (!mapCanvasBuf) {
@@ -604,6 +659,7 @@ static void buildMapCanvas(lv_obj_t *parent, int w, int h) {
     // updateMapCanvas(); pivot is fixed here.
     lv_image_set_pivot(mapCanvas, S / 2, S / 2);
     lv_image_set_antialias(mapCanvas, false); // nearest-neighbor: far cheaper per rotated frame on the ESP32
+#endif
 
     mapRendererSetGeometry(S, S / 2, S / 2, gRefMinDim);
     mapRendererSetZoomMultiplier(gMapZoomScale);
@@ -668,8 +724,14 @@ static void buildMapCanvas(lv_obj_t *parent, int w, int h) {
     lv_obj_set_pos(tempLabel, gCanvasW - 8 - 72, tempCy - 11); // right edge ~8px from the screen edge
 }
 
+#ifdef VIETHUD_P4
+volatile bool gMapPaused = false; // flicker diagnostic phase C (main_viethud.cpp 'Z')
+#endif
 static void updateMapCanvas() {
     if (!mapCanvas) return;
+#ifdef VIETHUD_P4
+    if (gMapPaused) return;
+#endif
     esp_task_wdt_reset();
 
     static MapViewSnapshot v;
@@ -721,6 +783,128 @@ static void updateMapCanvas() {
     float radiusM = (v.zoomRadiusM > 10.0f) ? v.zoomRadiusM : 300.0f;
     float pxPerM = (float)gRefMinDim / radiusM;
 
+#ifdef VIETHUD_P4
+    int32_t rot = 0;
+    {
+        // Heading-up rotation baked into the geometry: MapRenderer projects
+        // about the centre of its SxS square; each point is rotated about that
+        // centre and translated onto the ego anchor of the screen-sized
+        // canvas. Same maths (and sign) as the S3 bitmap rotation it replaces.
+        lv_canvas_fill_bg(mapCanvas, lv_color_hex(pal().bg), LV_OPA_COVER);
+        lv_layer_t layer;
+        lv_canvas_init_layer(mapCanvas, &layer);
+        esp_task_wdt_reset();
+        if (cfg.mapHeadingUp) {
+            rot = (int32_t)lroundf(-v.headingUpDeg * 10.0f);
+            rot %= 3600;
+            if (rot < 0) rot += 3600;
+        }
+        const float rr = rot * (float)M_PI / 1800.0f;
+        const float cR = cosf(rr), sR = sinf(rr);
+        const float cc = (float)gMapCenter;
+        const float ax0 = (float)gMapAnchorPX, ay0 = (float)gMapAnchorPY;
+        auto toScr = [&](float x, float y, float *sx, float *sy) {
+            float dx = x - cc, dy = y - cc;
+            *sx = ax0 + dx * cR - dy * sR;
+            *sy = ay0 + dx * sR + dy * cR;
+        };
+        const float W = (float)gMapPhysW, H = (float)gMapPhysH;
+        auto edgeOpaS = [&](float sx, float sy) -> lv_opa_t {
+            float fx = fminf(sx, W - sx) / 150.0f;
+            float fy = fminf(sy, H - sy) / 120.0f;
+            float f = fminf(fx, fy);
+            if (f <= 0.0f) return 0;
+            if (f >= 1.0f) return LV_OPA_COVER;
+            return (lv_opa_t)(f * f * (3.0f - 2.0f * f) * 255.0f);
+        };
+        lv_draw_line_dsc_t ld;
+        auto seg = [&](float x1, float y1, float x2, float y2, lv_color_t col, int32_t w, lv_opa_t opa) {
+            lv_draw_line_dsc_init(&ld);
+            ld.color = col;
+            ld.width = w;
+            ld.opa = opa;
+            // Round caps only on opaque strokes: overlapping translucent caps
+            // (edge-faded pieces) would show as beads.
+            ld.round_start = ld.round_end = opa >= LV_OPA_MAX ? 1 : 0;
+            ld.p1.x = (lv_value_precise_t)x1;
+            ld.p1.y = (lv_value_precise_t)y1;
+            ld.p2.x = (lv_value_precise_t)x2;
+            ld.p2.y = (lv_value_precise_t)y2;
+            lv_draw_line(&layer, &ld);
+        };
+        // A line in screen space, faded toward the screen edges; drawn in one
+        // stroke when it lies entirely in the fully-opaque interior.
+        auto fadedLineS = [&](float x1, float y1, float x2, float y2, lv_color_t col, int32_t w, lv_opa_t base) {
+            if ((x1 < 0 && x2 < 0) || (y1 < 0 && y2 < 0) || (x1 > W && x2 > W) || (y1 > H && y2 > H)) return;
+            if (edgeOpaS(x1, y1) == LV_OPA_COVER && edgeOpaS(x2, y2) == LV_OPA_COVER) {
+                seg(x1, y1, x2, y2, col, w, base);
+                return;
+            }
+            float len = sqrtf((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1));
+            int n = (int)ceilf(len / 24.0f);
+            if (n < 1) n = 1;
+            for (int k = 0; k < n; k++) {
+                float t0 = (float)k / n, t1 = (float)(k + 1) / n;
+                float ax = x1 + (x2 - x1) * t0, ay = y1 + (y2 - y1) * t0;
+                float bx = x1 + (x2 - x1) * t1, by = y1 + (y2 - y1) * t1;
+                lv_opa_t o = edgeOpaS((ax + bx) * 0.5f, (ay + by) * 0.5f);
+                if (o < 8) continue;
+                seg(ax, ay, bx, by, col, w, (lv_opa_t)((o * base) / 255));
+            }
+        };
+        // Pass order: small roads, then casing + fill for main, major, and the
+        // road we're on last, so junctions layer the way a printed map reads.
+        // Within a class, ALL casings first, then all fills — casing drawn per
+        // segment would notch the previous segment's fill (dashed look).
+        const lv_color_t casing = lv_color_mix(lv_color_black(), lv_color_hex(pal().bg), 150);
+        for (int pass = 0; pass < 4; pass++) {
+            for (int layerIdx = (pass > 0 ? 0 : 1); layerIdx < 2; layerIdx++) {
+                for (int i = 0; i < v.lineCount; i++) {
+                    const MapLine &ln = v.lines[i];
+                    const int c = ln.roadClass;
+                    const bool cur = c == kMapLineCurrentRoad;
+                    const int rank = cur ? 3 : (c == 1 ? 2 : (c == 2 ? 1 : 0));
+                    if (rank != pass) continue;
+                    RoadClassStyle st = mapClassStyle(ln.roadClass);
+                    int32_t w = st.width * 3 / 2 + (cur ? 2 : 0);
+                    float x1, y1, x2, y2;
+                    toScr(ln.x1, ln.y1, &x1, &y1);
+                    toScr(ln.x2, ln.y2, &x2, &y2);
+                    if (layerIdx == 0) fadedLineS(x1, y1, x2, y2, casing, w + 4, LV_OPA_COVER);
+                    else fadedLineS(x1, y1, x2, y2, st.color, w, LV_OPA_COVER);
+                }
+            }
+        }
+        if (cfg.showVehicleTrail) {
+            for (int i = 1; i < v.trailCount; i++) {
+                int denom = v.trailCount > 1 ? v.trailCount - 1 : 1;
+                float x1, y1, x2, y2;
+                toScr(v.trailX[i - 1], v.trailY[i - 1], &x1, &y1);
+                toScr(v.trailX[i], v.trailY[i], &x2, &y2);
+                fadedLineS(x1, y1, x2, y2, lv_color_hex(ACCENT_COLOR), 4, (lv_opa_t)(60 + (195 * i) / denom));
+            }
+        }
+        lv_draw_rect_dsc_t dot;
+        for (int i = 0; i < v.markerCount; i++) {
+            const MapMarker &m = v.markers[i];
+            float sx, sy;
+            toScr(m.x, m.y, &sx, &sy);
+            lv_opa_t o = edgeOpaS(sx, sy);
+            if (o < 8) continue;
+            lv_draw_rect_dsc_init(&dot);
+            dot.bg_color = mapMarkerColor(m.kind);
+            dot.bg_opa = o;
+            dot.radius = LV_RADIUS_CIRCLE;
+            dot.border_color = lv_color_white();
+            dot.border_width = 2;
+            dot.border_opa = (lv_opa_t)((o * 200) / 255);
+            lv_area_t area = {(int32_t)sx - 8, (int32_t)sy - 8, (int32_t)sx + 8, (int32_t)sy + 8};
+            lv_draw_rect(&layer, &dot, &area);
+        }
+        lv_canvas_finish_layer(mapCanvas, &layer);
+        esp_task_wdt_reset();
+    }
+#else
     lv_canvas_fill_bg(mapCanvas, lv_color_hex(pal().bg), LV_OPA_COVER);
 
     lv_layer_t layer;
@@ -825,6 +1009,7 @@ static void updateMapCanvas() {
     // clockwise-positive; -heading (mod 360) makes the travel direction up.
     // cfg.mapHeadingUp off = north-up (rotation 0), the simpler/proven mode.
     lv_image_set_rotation(mapCanvas, rot); // computed above (also used by the edge fade)
+#endif
     esp_task_wdt_reset();
 
     // Periodic map-render diagnostics (every ~3s) so the map pipeline is
@@ -886,7 +1071,7 @@ static lv_obj_t *makeIcon(lv_obj_t *parent, const lv_image_dsc_t *src) {
 // ever collapse a child to near-zero.
 // ---------------------------------------------------------------------
 static void buildDashboardLandscape(lv_obj_t *scr) {
-    const int scrW = 480, scrH = 320;
+    const int scrW = LS_SCR_W, scrH = LS_SCR_H;
     const int topH = kTopBarH;
 
     // ---------------- Top status bar (Full width 480, Glassmorphism) ----------------
@@ -1052,7 +1237,11 @@ static void buildDashboardLandscape(lv_obj_t *scr) {
 // removed 2026-09-21; the alert card fills that same freed space now).
 // ---------------------------------------------------------------------
 static void buildDashboardPortrait(lv_obj_t *scr) {
+#ifdef VIETHUD_P4
+    const int scrW = 320, scrH = 533; // P4 design screen (x1.5 = 480x800)
+#else
     const int scrW = 320, scrH = 480;
+#endif
     const int topH = 36;
 
     // ---------------- Top status bar (Full width 320, Glassmorphism) ----------------
@@ -1503,6 +1692,36 @@ void refreshDashboard() {
         // windscreen, 2026-09-26). Read with the range that fits: -10..80 C
         // (+-1 C), 20..100 C (+-2 C) or 50..125 C (+-3 C), with hysteresis, and
         // re-read at once in the higher range if the current one saturated.
+#ifdef VIETHUD_P4
+        // IDF 5 aborts if the legacy temp_sensor driver meets the new one the
+        // core links in, so on the P4 use temperature_sensor with the same
+        // range-adaptive idea: one handle per range, re-read one range up
+        // when the current one saturates, drift back down with hysteresis.
+        auto readDieTempC = []() -> float {
+            static const int kR[3][2] = {{-10, 80}, {20, 100}, {50, 125}};
+            static temperature_sensor_handle_t h[3] = {nullptr, nullptr, nullptr};
+            static int range = 0;
+            auto readIn = [](int r) {
+                float c = NAN;
+                if (!h[r]) {
+                    temperature_sensor_config_t tc = TEMPERATURE_SENSOR_CONFIG_DEFAULT(kR[r][0], kR[r][1]);
+                    if (temperature_sensor_install(&tc, &h[r]) != ESP_OK) return c;
+                }
+                if (temperature_sensor_enable(h[r]) == ESP_OK) {
+                    temperature_sensor_get_celsius(h[r], &c);
+                    temperature_sensor_disable(h[r]);
+                }
+                return c;
+            };
+            float c = readIn(range);
+            if (range == 0 && !(c < 78.0f)) c = readIn(range = 1);
+            if (range == 1 && !(c < 98.0f)) c = readIn(range = 2);
+            if (range == 0 && c >= 75.0f) range = 1;
+            else if (range == 1 && c < 65.0f) range = 0;
+            else if (range == 2 && c < 90.0f) range = 1;
+            return c;
+        };
+#else
         auto readDieTempC = []() -> float {
             static temp_sensor_dac_offset_t range = TSENS_DAC_L2;
             auto readIn = [](temp_sensor_dac_offset_t r) {
@@ -1523,6 +1742,7 @@ void refreshDashboard() {
             else if (range == TSENS_DAC_L0 && c < 90.0f) range = TSENS_DAC_L1;
             return c;
         };
+#endif
         static uint32_t sLastTempMs = 0;
         static float sTempC = -999.0f;
         static int sLastTier = 0;
@@ -1603,7 +1823,17 @@ void refreshDashboard() {
     bool blinkOn = (millis() / 500) % 2 == 0;
     lv_color_t gnssColor;
     char gBuf[24];
-    if (gnss.fix) {
+    if (gnss.fix && (gnss.fixSeq & 0x80000000u)) {
+        // Simulated fix (serial S/W/R drive sims, or the automatic road sim
+        // when no GNSS module is fitted): say so plainly — never pass a
+        // simulated position off as a real satellite fix.
+        gnssColor = lv_color_hex(0xB07CFF);
+        snprintf(gBuf, sizeof(gBuf), "SIM");
+    } else if (gnss.fix && gnss.fromPhone) {
+        // Position from the phone over BLE — say where it comes from.
+        gnssColor = lv_color_hex(0x3DA5FF);
+        snprintf(gBuf, sizeof(gBuf), "PHONE");
+    } else if (gnss.fix) {
         gnssColor = lv_color_hex(STATUS_GREEN);
         snprintf(gBuf, sizeof(gBuf), "%d", gnss.satCount);
     } else if (gnss.linkAlive) {
@@ -1750,6 +1980,9 @@ void refreshDashboard() {
             audioQueueVoice("slowdown/voice.mp3");
         }
     }
+    if (speeding != lastSpeeding)
+        Serial.printf("[speed] %s v=%.0f lim=%d thr=%.0f\n", speeding ? "OVER" : "ok", (double)gnss.egoSpeedKmh,
+                      (int)road.speedLimitKmh, (double)overspeedThreshold);
     lastSpeeding = speeding;
 
     if (gnss.fix) {

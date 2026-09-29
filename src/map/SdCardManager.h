@@ -26,6 +26,11 @@
 // here is a plain `return false` plus one `Serial.println`, and the caller
 // falls back to reporting UNKNOWN (spec sections 31, 35, 36).
 bool sdMgrMount();
+// The filesystem holding /speedmap and /triplog: the microSD card, or on the
+// P4 board the internal-flash FAT fallback when no card is fitted.
+namespace fs { class FS; }
+fs::FS &sdMgrDataFs();
+bool sdMgrDataOnFlash();
 
 bool sdMgrIsAvailable(); // true only after a successful sdMgrMount()
 
