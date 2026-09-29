@@ -184,12 +184,32 @@ function disconnect() {
 }
 
 // ---- GPS ----
+// iOS reports kCLErrorLocationUnknown ("kCLErrorDomain error 0") whenever it
+// briefly loses the fix (indoors, tunnels) and the page's watch then goes
+// quiet — so restart the watch after errors and whenever no position has
+// arrived for 10 s. Old positions are never re-sent as new ones.
+let lastFixAt = 0, restartTimer = null;
+function restartGps(why, delayMs) {
+  if (restartTimer || !wantConnected) return;
+  log('GPS restart (' + why + ')');
+  restartTimer = setTimeout(() => { restartTimer = null; if (wantConnected) startGps(); }, delayMs);
+}
+setInterval(() => {
+  if (wantConnected && watchId != null && Date.now() - lastFixAt > 10000) {
+    setGps('warn', 'Mất tín hiệu GPS – đang tìm lại…');
+    restartGps('no fix for 10 s', 0);
+    lastFixAt = Date.now(); // one restart per 10 s at most
+  }
+}, 2000);
 function startGps() {
   if (!navigator.geolocation) { setGps('bad', 'Không hỗ trợ'); return; }
+  if (watchId != null) navigator.geolocation.clearWatch(watchId);
   setGps('warn', 'Đang tìm vị trí…');
+  lastFixAt = Date.now();
   watchId = navigator.geolocation.watchPosition(async pos => {
     const c = pos.coords, { kmh, hdg } = derive(pos);
     last = pos;
+    lastFixAt = Date.now();
     setGps(c.accuracy <= 20 ? 'ok' : 'warn', '±' + Math.round(c.accuracy) + ' m');
     $('spd').textContent = kmh == null ? '--' : Math.round(kmh);
     $('hdg').textContent = hdg == null ? '--' : Math.round(hdg) + '°';
@@ -198,8 +218,13 @@ function startGps() {
     lastSend = Date.now();
     try { await write(nmea(c.latitude, c.longitude, kmh, hdg, c.accuracy, new Date(pos.timestamp))); $('cnt').textContent = ++sent; }
     catch (e) { log('write: ' + e.message); }
-  }, err => { setGps('bad', err.message); log('GPS: ' + err.message); },
-  { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 });
+  }, err => {
+    // code 1 = permission denied (needs the user), 2 = position unavailable, 3 = timeout
+    log('GPS: ' + err.code + ' ' + err.message);
+    if (err.code === 1) { setGps('bad', 'Chưa cho phép vị trí: Cài đặt → Bluefy → Vị trí'); return; }
+    setGps('warn', 'Mất tín hiệu GPS – đang tìm lại…');
+    restartGps('error ' + err.code, 3000);
+  }, { enableHighAccuracy: true, maximumAge: 0 });
 }
 
 // ---- keep the screen on (iOS suspends background web pages) ----
@@ -212,7 +237,7 @@ document.addEventListener('visibilitychange', () => { if (document.visibilitySta
 $('btn').onclick = () => (wantConnected ? disconnect() : connect());
 window.addEventListener('error', ev => log('JS error: ' + ev.message));
 window.addEventListener('unhandledrejection', ev => log('unhandled: ' + errText(ev.reason)));
-log('page v2 | bluetooth=' + !!navigator.bluetooth + ' geolocation=' + !!navigator.geolocation +
+log('page v3 | bluetooth=' + !!navigator.bluetooth + ' geolocation=' + !!navigator.geolocation +
     ' secure=' + window.isSecureContext + ' | ' + navigator.userAgent.slice(0, 80));
 if (!navigator.bluetooth) { setBle('bad', 'Trình duyệt không có Web Bluetooth – hãy mở trong app Bluefy'); $('btn').disabled = true; }
 </script>
