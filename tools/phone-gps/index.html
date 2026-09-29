@@ -115,8 +115,11 @@ async function write(str) {
 }
 async function gattConnect() {
   setBle('warn', 'Đang kết nối…');
+  log('gatt.connect ' + (device.name || device.id));
   const server = await device.gatt.connect();
+  log('getPrimaryService');
   const svc = await server.getPrimaryService(NUS);
+  log('getCharacteristic');
   rxChar = await svc.getCharacteristic(RX);
   setBle('ok', 'Đã kết nối ' + (device.name || 'VietHUD'));
   log('BLE connected');
@@ -130,9 +133,38 @@ async function onDisconnected() {
     try { await gattConnect(); return; } catch (e) { log('retry: ' + e.message); }
   }
 }
+// Readable text from whatever the browser threw (Bluefy can reject with a
+// bare string, an empty object, or an Error).
+function errText(e) {
+  if (!e) return 'unknown error';
+  if (typeof e === 'string') return e;
+  if (e.name || e.message) return (e.name ? e.name + ': ' : '') + (e.message || '');
+  try { return JSON.stringify(e); } catch (x) { return String(e); }
+}
+// Bluefy validates requestDevice() more strictly than Chrome: try the simplest
+// filter first, then by name, then show every device.
+async function pickDevice() {
+  const tries = [
+    { label: 'service UUID', opts: { filters: [{ services: [NUS] }] } },
+    { label: 'name VietHUD', opts: { filters: [{ namePrefix: 'VietHUD' }], optionalServices: [NUS] } },
+    { label: 'all devices', opts: { acceptAllDevices: true, optionalServices: [NUS] } },
+  ];
+  let lastErr = null;
+  for (const t of tries) {
+    try {
+      log('requestDevice (' + t.label + ')');
+      return await navigator.bluetooth.requestDevice(t.opts);
+    } catch (e) {
+      lastErr = e;
+      log('  -> ' + errText(e));
+      if (e && e.name === 'NotFoundError' && /cancel/i.test(e.message || '')) throw e; // user cancelled
+    }
+  }
+  throw lastErr;
+}
 async function connect() {
   try {
-    device = await navigator.bluetooth.requestDevice({ filters: [{ services: [NUS] }, { namePrefix: 'VietHUD' }], optionalServices: [NUS] });
+    device = await pickDevice();
     device.addEventListener('gattserverdisconnected', onDisconnected);
     wantConnected = true;
     await gattConnect();
@@ -140,7 +172,7 @@ async function connect() {
     keepAwake();
     $('btn').textContent = 'Ngắt kết nối';
     $('btn').className = 'sec';
-  } catch (e) { setBle('bad', 'Lỗi: ' + e.message); log(e.message); }
+  } catch (e) { setBle('bad', 'Lỗi: ' + errText(e)); log('connect failed: ' + errText(e)); }
 }
 function disconnect() {
   wantConnected = false;
@@ -178,6 +210,10 @@ async function keepAwake() {
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && wantConnected) keepAwake(); });
 
 $('btn').onclick = () => (wantConnected ? disconnect() : connect());
+window.addEventListener('error', ev => log('JS error: ' + ev.message));
+window.addEventListener('unhandledrejection', ev => log('unhandled: ' + errText(ev.reason)));
+log('page v2 | bluetooth=' + !!navigator.bluetooth + ' geolocation=' + !!navigator.geolocation +
+    ' secure=' + window.isSecureContext + ' | ' + navigator.userAgent.slice(0, 80));
 if (!navigator.bluetooth) { setBle('bad', 'Trình duyệt không có Web Bluetooth – hãy mở trong app Bluefy'); $('btn').disabled = true; }
 </script>
 </body>
