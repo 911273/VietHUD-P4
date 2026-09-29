@@ -25,6 +25,13 @@ bool roadSimActive();
 // the simulated fix) while active.
 bool roadSimStep(float *lat, float *lon, float *headingDeg, float *speedKmh);
 
-// Default start point for the automatic no-GPS demo: Hoàng Quốc Việt, Hà Nội.
-static const float kRoadSimDefaultLat = 21.04660f;
+// Default start point for the automatic no-GPS demo. On the P4 bench board it
+// must lie inside the regional flash dataset (tools/map_builder/
+// make_region_subset.py, cut around Phù Lỗ / Sóc Sơn on 2026-09-29).
+#ifdef VIETHUD_P4
+static const float kRoadSimDefaultLat = 21.25220f;
+static const float kRoadSimDefaultLon = 105.86811f;
+#else
+static const float kRoadSimDefaultLat = 21.04660f; // Hoàng Quốc Việt, Hà Nội
 static const float kRoadSimDefaultLon = 105.78520f;
+#endif

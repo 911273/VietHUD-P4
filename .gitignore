@@ -53,3 +53,4 @@ VietHUD_SDCard_WYN_PURE/
 
 # P4 flash data image staging (copy of speedmap/, built with -t buildfs)
 data_p4/
+data_p4_hn_major/
